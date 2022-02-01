@@ -1,0 +1,399 @@
+#!/usr/bin/env groovy
+
+// Project specifics
+String stepRunnerConfigDir = 'ploigos-step-runner-config/'
+String pgpKeysSecretName = 'pgp-keys-ploigos-workflow-ref-quarkus-mvn-jenkins-eve-fruit'
+String workflowServiceAccountName = 'quarkus-quickstart-workflow'
+
+
+/* Match everything that isn't a-z, a-Z, 0-9, -, _, or .
+*
+* See https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#syntax-and-character-set
+*/
+String KUBE_LABEL_NOT_SAFE_CHARS_REGEX = /[^a-zA-Z0-9\-_\.]/
+int KUBE_LABEL_MAX_LENGTH = 62
+
+// SEE: https://stackoverflow.com/questions/25088034/use-git-repo-name-as-env-variable-in-jenkins-job
+String GIT_BRANCH = scm.branches[0].name
+String GIT_BRANCH_KUBE_LABEL_VALUE = GIT_BRANCH
+    .replaceAll(KUBE_LABEL_NOT_SAFE_CHARS_REGEX, '_')
+    .drop(GIT_BRANCH.length()-KUBE_LABEL_MAX_LENGTH)
+String GIT_URL = scm.userRemoteConfigs[0].url
+String GIT_REPO_NAME = "${GIT_URL.replaceFirst(/^.*\/([^\/]+?).git$/, '$1')}"
+String GIT_REPO_NAME_KUBE_LABEL_VALUE = GIT_REPO_NAME
+    .replaceAll(KUBE_LABEL_NOT_SAFE_CHARS_REGEX, '-')
+    .drop(GIT_REPO_NAME.length()-KUBE_LABEL_MAX_LENGTH)
+
+/* Workspace for the container users home directory.
+ *
+ * Important because the home directory is where the python virtual environment will be setup
+ * to be shared with future steps. */
+String WORKFLOW_WORKER_WORKSPACE_HOME_PATH = "/home/ploigos"
+
+/* CPU resource request for worker pods created when running this pipeline */
+String workflowWorkersRequestsCPU = '.1'
+
+/* Memory resource request for worker pods created when running this pipeline */
+String workflowWorkersRequestsMemory = '100Mi'
+
+/* CPU resource limit for worker pods created when running this pipeline */
+String workflowWorkersLimitsCPU = '1'
+
+/* Memory resource limit for worker pods created when running this pipeline */
+String workflowWorkersLimitsMemory = '1Gi'
+
+String workerImageDefault = "registry.redhat.io/openshift-pipelines/pipelines-cli-tkn-rhel8:0.19.0-3"
+String workerImageOc = "registry.redhat.io/openshift4/ose-cli:v4.9.0-202201211735.p0.g3f16530.assembly.stream"
+
+String workflowWorkersImagePullPolicy = 'IfNotPresent'
+String workerNameOc = 'worker-oc'
+
+pipeline {
+    options {
+        ansiColor('xterm')
+    }
+    agent {
+        kubernetes {
+            cloud 'openshift'
+            defaultContainer workerNameOc
+            yaml """
+apiVersion: v1
+kind: Pod
+metadata:
+    labels:
+        git-repo-name: ${GIT_REPO_NAME_KUBE_LABEL_VALUE}
+        git-branch-name: ${GIT_BRANCH_KUBE_LABEL_VALUE}
+        jenkins-build-id: ${env.BUILD_ID}
+spec:
+    serviceAccount: ${workflowServiceAccountName}
+    containers:
+    - name: ${workerNameOc}
+      image: "${workerImageOc}"
+      resources:
+        limits:
+          cpu: "${workflowWorkersLimitsCPU}"
+          memory: "${workflowWorkersLimitsMemory}"
+        requests:
+          cpu: "${workflowWorkersRequestsCPU}"
+          memory: "${workflowWorkersRequestsMemory}"
+      tty: true
+    volumes:
+    - name: home-ploigos
+      emptyDir: {}
+    - name: pgp-private-keys
+      secret:
+        secretName: ${pgpKeysSecretName}
+"""
+        }
+    }
+
+    stages {
+        stage('SETUP: Create PVCs') {
+            steps {
+                container('worker-oc') {
+                    script {
+sh '''
+oc create -f - << EOF
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: app-${BUILD_ID}
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  storageClassName: gp2
+  volumeMode: Filesystem
+EOF
+'''
+
+sh '''
+oc create -f - << EOF
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: home-${BUILD_ID}
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  storageClassName: gp2
+  volumeMode: Filesystem
+EOF
+'''
+                    }
+                }
+            }
+        }
+        stage('SETUP: Git Clone') {
+            steps {
+                script {
+                    runTask(
+                        taskKind: "ClusterTask",
+                        taskRunNamePrefix: "ploigos-git-clone",
+                        taskName: "ploigos-git-clone",
+                        pvWorkspaces: ["output": "app-${BUILD_ID}"],
+                        params: [
+                            verbose: 'false', 
+                            image: 'gcr.io/tekton-releases/github.com/tektoncd/pipeline/cmd/git-init:v0.12.1', 
+                            imagePullPolicy: workflowWorkersImagePullPolicy, 
+                            url: GIT_URL, 
+                            revision: GIT_BRANCH, 
+                            deleteExisting: 'true', 
+                            sslVerify: 'false', 
+                            refspec: "+refs/heads/${GIT_BRANCH}:${GIT_BRANCH}"
+                        ]
+                    )
+                }
+             }
+        }
+        stage('SETUP: Setup Step Runner') {
+            steps {
+                script {
+                    runTask(
+                        taskKind: "ClusterTask",
+                        taskRunNamePrefix: "ploigos-setup-workflow-step-runner",
+                        taskName: "ploigos-setup-workflow-step-runner",
+                        pvWorkspaces: ["home": "home-${BUILD_ID}"],
+                        params: [
+                             verbose: 'false',
+                             image: 'ploigos/ploigos-base:v0.22.0',
+                             imagePullPolicy: workflowWorkersImagePullPolicy,
+                             stepRunnerPackageName: 'ploigos-step-runner',
+                             stepRunnerUpdateLibrary: 'false',
+                             stepRunnerLibSourceUrl: '',
+                             stepRunnerLibIndexUrl: 'https://pypi.org/simple/',
+                             stepRunnerLibExtraIndexUrl: 'https://pypi.org/simple/',
+                             stepRunnerLibVersion: ''
+                        ]
+                    )
+                }
+             }
+        }
+        stage('SETUP: Import PGP Keys') {
+            steps {
+                script {
+                    runTask(
+                        taskKind: "ClusterTask",
+                        taskRunNamePrefix: "import-pgp-keys",
+                        taskName: "import-pgp-keys",
+                        pvWorkspaces: ["home": "home-${BUILD_ID}"],
+                        params: [
+                            verbose: 'false',
+                            image: 'ploigos/ploigos-base:v0.22.0',
+                            imagePullPolicy: workflowWorkersImagePullPolicy,
+                            pgpKeysSecretName: 'pgp-keys'
+                        ]
+                    )
+                }
+             }
+        }
+        stage('CI: Generate Metadata') {
+            steps {
+                script {
+                    runTask(
+                        taskKind: "ClusterTask",
+                        taskRunNamePrefix: "generate-metadata",
+                        taskName: "ploigos-step-runner",
+                        pvWorkspaces: ["app": "app-${BUILD_ID}", "home": "home-${BUILD_ID}"],
+                        params: [
+                            verbose: 'false',
+                            image: 'ploigos/ploigos-base:v0.22.0',
+                            imagePullPolicy: workflowWorkersImagePullPolicy,
+                            stepRunnerPackageName: 'ploigos-step-runner',
+                            venvPath: '/home/ploigos/venv-ploigos',
+                            stepName: 'generate-metadata',
+                            stepRunnerConfigDir: 'ploigos-step-runner-config/'
+                        ]
+                    )
+                }
+             }
+        }
+        stage('CI: Run Unit Tests') {
+            steps {
+                script {
+                    runTask(
+                        taskKind: "ClusterTask",
+                        taskRunNamePrefix: "unit-test",
+                        taskName: "ploigos-step-runner",
+                        pvWorkspaces: ["app": "app-${BUILD_ID}", "home": "home-${BUILD_ID}"],
+                        params: [
+                            verbose: 'false',
+                            image: 'ploigos/ploigos-tool-maven:v0.22.0',
+                            imagePullPolicy: workflowWorkersImagePullPolicy,
+                            stepRunnerPackageName: 'ploigos-step-runner',
+                            venvPath: '/home/ploigos/venv-ploigos',
+                            stepName: 'unit-test',
+                            stepRunnerConfigDir: 'ploigos-step-runner-config/'
+                        ]
+                    )
+                }
+             }
+        }
+        stage('CI: Package Application') {
+            steps {
+                script {
+                    runPsrTask('package')
+                }
+             }
+        }
+        stage('CI: Static Code Analysis') {
+            steps {
+                script {
+                    runPsrTask('static-code-analysis')
+                }
+             }
+        }
+        stage('CI: Push Application to Repository') {
+            steps {
+                script {
+                    runPsrTask('push-artifacts')
+                }
+             }
+        }
+        stage('CI: Create Container Image') {
+            steps {
+                script {
+                    runPsrTask('create-container-image')
+                }
+             }
+        }
+        stage('CI: Static Image Scan: Compliance') {
+            steps {
+                script {
+                    runPsrTask('container-image-static-compliance-scan')
+                }
+             }
+        }
+        stage('CI: Static Image Scan: Vulnerability') {
+            steps {
+                script {
+                    runPsrTask('container-image-static-vulnerability-scan')
+                }
+             }
+        }
+        stage('CI: Push Container Image to Repository') {
+            steps {
+                script {
+                    runPsrTask('push-container-image')
+                }
+             }
+        }
+    } // pipeline stages
+} // pipeline
+
+def runPsrTask(String stepName) {
+    runTask(
+        taskKind: "ClusterTask",
+        taskRunNamePrefix: stepName,
+        taskName: "ploigos-step-runner",
+        pvWorkspaces: ["app": "app-${BUILD_ID}", "home": "home-${BUILD_ID}"],
+        params: [
+            verbose: 'false',
+            image: 'ploigos/ploigos-base:v0.22.0',
+            imagePullPolicy: workflowWorkersImagePullPolicy,
+            stepRunnerPackageName: 'ploigos-step-runner',
+            venvPath: '/home/ploigos/venv-ploigos',
+            stepName: stepName,
+            stepRunnerConfigDir: 'ploigos-step-runner-config/'
+        ]
+    )
+}
+String K8S_UTILITY = 'oc' // You can replace oc with kubectl
+
+def runTask(Map args) {
+//def runTask(String taskKind, String taskRunNamePrefix, String taskName, Map<String, String> pvWorkspaces, Map<String, String> params) {
+
+    // Create the TaskRun
+    String taskRunName = "${args.taskRunNamePrefix}-${UUID.randomUUID().toString().substring(0, 4)}"
+    String taskRunYaml = buildTaskRunYaml(args, taskRunName)
+String createCommand =
+"""
+oc create -f - << EOF
+${taskRunYaml}
+EOF
+"""
+    sh createCommand
+    echo "Created TaskRun - ${taskRunName}"
+
+    // Get the name of the Pod that Tekton starts for the TaskRun
+    String podName = sh(returnStdout: true, script: """
+        oc get taskrun ${taskRunName} -o go-template --template='{{.status.podName}}'
+    """).trim()
+    echo "Pod Created - ${podName}"
+
+    // Wait until Pod progresses past Pending phase
+    echo "Waiting for Pod to start ..."
+    def podDef
+    while(true) {
+        String podYaml = sh(returnStdout: true, script: """
+            oc get po ${podName} -o yaml
+        """)
+        podDef = readYaml text: podYaml
+        if(podDef && podDef.status && podDef.status.phase != 'Pending') {
+            break
+        }
+        else {
+            sleep 10
+        }
+    }
+
+    // Get the logs for each Step of the Task. Each Step is a Container in the Pod.
+    podDef.status.containerStatuses.each {
+        echo it.name
+        sh "oc logs -f --pod-running-timeout=5m ${podName} -c ${it.name}"
+    }
+}
+
+def buildTaskRunYaml(Map args, String taskRunName) {
+
+    String TEKTON_SERVICE_ACCOUNT = 'quarkus-quickstart-workflow'
+    String TASK_RUN_TIMEOUT = '1h0m0s'
+
+    // Generate random name for TaskRun using prefix
+
+    // Initial definition
+    String taskRunSpec = """
+    apiVersion: tekton.dev/v1beta1
+    kind: TaskRun
+    metadata:
+      name: ${taskRunName}
+    spec:
+      params:
+    """
+    
+   // Params
+    args.params.each {
+    taskRunSpec += """
+      - name: "${it.key}"
+        value: "${it.value}"
+    """
+    }
+    
+    // More definition
+    taskRunSpec += """
+      serviceAccountName: ${TEKTON_SERVICE_ACCOUNT}
+      taskRef:
+        kind: ${args.taskKind}
+        name: ${args.taskName}
+      timeout: ${TASK_RUN_TIMEOUT}
+      workspaces:
+    """
+    
+    // Workspaces (PersistentVolumeClaims)
+    args.pvWorkspaces.each {
+    taskRunSpec += """
+      - name: ${it.key}
+        persistentVolumeClaim:
+          claimName: ${it.value}
+    """
+    }
+
+    print taskRunSpec
+    return taskRunSpec
+}
+
