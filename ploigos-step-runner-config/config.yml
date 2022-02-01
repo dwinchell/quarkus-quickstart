@@ -21,6 +21,7 @@ step-runner-config:
             username: 6340056|tssc-integration-infra
         registry-internal-nexus.apps.tssc.rht-set.com:
             username: sa-ploigos-ref-apps
+
   generate-metadata:
   - implementer: Maven
   - implementer: Git
@@ -60,8 +61,16 @@ step-runner-config:
   sign-container-image:
   - implementer: PodmanSign
     config:
-      container-image-signature-destination-url: http://artifactory.apps.tssc.rht-set.com/artifactory/container-image-signatures
-      container-image-signature-destination-username: tssc
+      container-image-signature-destination-url: https://nexus.apps.tssc.rht-set.com/repository/container-image-signatures/
+      container-image-signature-destination-username: sa-ploigos-ref-apps
+
+  container-image-static-compliance-scan:
+  - name: OpenSCAP - Compliance - SSG RHEL8
+    implementer: OpenSCAP
+    config:
+      oscap-input-definitions-uri: https://atopathways.redhatgov.io/compliance-as-code/scap/ssg-rhel8-ds.xml
+      oscap-tailoring-uri: https://raw.githubusercontent.com/ploigos/ploigos-example-oscap-content/main/xccdf_com.ploigos_profile_standard_compliance_ploigos_reference_apps-tailoring.xml
+      oscap-profile: xccdf_com.ploigos_profile_standard_compliance_ploigos_reference_apps
 
   container-image-static-vulnerability-scan:
   - name: OpenSCAP - Vulnerability - DataStream
@@ -94,7 +103,7 @@ step-runner-config:
   - implementer: ConfiglintFromArgocd
   - implementer: Configlint
     config:
-      rules: cicd/ValidateEnv/
+      rules: ValidateEnv/
 
   uat:
   - implementer: MavenIntegrationTest
@@ -107,7 +116,35 @@ step-runner-config:
         path: 'target/cucumber-reports'
 
   report:
-  - implementer: ResultArtifactsArchive
+  - name: Generate and Push Results Report
+    implementer: ResultArtifactsArchive
     config:
       results-archive-destination-url: https://nexus.apps.tssc.rht-set.com/repository/release-engineering-workflow-result-artifacts-archives/
       results-archive-destination-username: sa-ploigos-ref-apps
+  - name: Sign Results Report
+    implementer: RekorSignReport
+    config:
+      rekor-server-url: https://rekor.apps.tssc.rht-set.com/
+
+  generate-evidence:
+  - name: Generate and Push Evidence
+    implementer: GenerateEvidence
+    config:
+      evidence-destination-url: https://nexus.apps.tssc.rht-set.com/repository/release-engineering-workflow-evidence/
+      evidence-destination-username: sa-ploigos-ref-apps
+  - name: Sign Evidence
+    implementer: RekorSignEvidence
+    config:
+      rekor-server-url: https://rekor.apps.tssc.rht-set.com/
+
+  audit-attestation:
+  - name: Audit Attestation DEV
+    implementer: OpenPolicyAgent
+    environment-config:
+      DEV:
+        workflow-policy-uri: https://raw.githubusercontent.com/ploigos/ploigos-example-autogov-content/main/workflow-policy-dev.rego
+      TEST:
+        workflow-policy-uri: https://raw.githubusercontent.com/ploigos/ploigos-example-autogov-content/main/workflow-policy-test.rego
+      PROD:
+        workflow-policy-uri: https://raw.githubusercontent.com/ploigos/ploigos-example-autogov-content/main/workflow-policy-prod.rego
+

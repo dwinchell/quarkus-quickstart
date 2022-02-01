@@ -7,15 +7,16 @@ retriever: modernSCM([
 
 // run the pipeline
 ploigosWorkflowMinimal(
-    stepRunnerConfigDir: 'cicd/ploigos-integration-environment/jenkins/minimal/ploigos-step-runner-config/',
+    stepRunnerConfigDir: 'ploigos-step-runner-config/',
 
     pgpKeysSecretName: 'pgp-keys-ploigos-workflow-ref-quarkus-mvn-jenkins-min-fruit',
     workflowServiceAccountName: 'ploigos-workflow-ref-quarkus-mvn-jenkins-min-fruit',
 
-    workflowWorkerImageDefault: 'ploigos/ploigos-tool-maven:v1.0.0',
+    workflowWorkerImageDefault: 'ploigos/ploigos-tool-autogov:v1.0.0',
+    // workflowWorkerImageDefault: 'ploigos/ploigos-tool-maven:v1.0.0', // Use this instead if the app doesn't also have to support the "everything" workflow
+
     workflowWorkerImageAgent: 'ploigos/ploigos-ci-agent-jenkins:v1.0.0',
     workflowWorkerImagePackage: 'ploigos/ploigos-tool-maven:v1.0.0',
     workflowWorkerImageContainerOperations: 'ploigos/ploigos-tool-containers:v1.0.0',
-    workflowWorkerImageDeploy: 'ploigos/ploigos-tool-argocd:v1.0.0',
+    workflowWorkerImageDeploy: 'ploigos/ploigos-tool-argocd:v1.0.0'
 )
-
